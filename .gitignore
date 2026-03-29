@@ -1,0 +1,19 @@
+# 忽略虚拟环境 (非常重要，否则会上传几百MB没用的文件)
+venv/
+__pycache__/
+.vscode/
+data/*.csv
+
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 忽略 VSCode 配置
+.vscode/
+
+# 忽略日志文件
+*.log
+
+# 如果数据文件特别大（超过100MB），通常也建议忽略，但你的 CSV 很小可以上传
+# data/*.csv
