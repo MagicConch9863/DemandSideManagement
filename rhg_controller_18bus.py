@@ -1,96 +1,222 @@
+import pandapower as pp
+import pandapower.networks as nw
+from pyomo.environ import *
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
 import os
+import sys
 
-def plot_triple_comparison():
-    # ===== 1. 智能路径解析 (彻底解决路径报错) =====
-    try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-    except NameError:
-        current_dir = os.getcwd()
+# ==========================================
+# 1. Konfigurationsparameter
+# ==========================================
+current_dir = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(current_dir, "data", "load_profile_forecast_18bus.csv")
 
-    if os.path.basename(current_dir) == 'analysis':
-        project_root = os.path.dirname(current_dir)
-    else:
-        project_root = current_dir
+HORIZON_N = 32         # 预测窗口：32个15min = 8小时
+NUM_AGENTS = 14        # R1-R14 sind aktive Prosumer
+SOLVER_NAME = "gurobi"
 
-    # 精准拼装三个算法的 CSV 路径
-    rhg_path = os.path.join(project_root, "data", "simulation_results_rhg_18bus.csv")
-    heu_path = os.path.join(project_root, "data", "heuristic_results_18bus.csv")
-    duo_path = os.path.join(project_root, "data", "duopoly_results_18bus.csv")
-    
-    output_fig_path = os.path.join(project_root, "outputs", "rhg_vs_heu_vs_stackelberg_48h.png")
-    
-    # 检查文件是否存在
-    files = [rhg_path, heu_path, duo_path]
-    if not all(os.path.exists(f) for f in files):
-        print("\n❌ 错误: 缺少 CSV 数据文件。请确认 RHG、Heuristic 和 Duopoly 是否都已经运行完毕。")
-        for f in files: print(f"{'✅ 已找到' if os.path.exists(f) else '❌ 未找到'}: {f}")
-        return
+# 扩展为 48h = 192 个时刻
+TOTAL_SIM_STEPS = 192
 
-    # ===== 2. 读取数据 =====
-    df_rhg = pd.read_csv(rhg_path)
-    df_heu = pd.read_csv(heu_path)
-    df_duo = pd.read_csv(duo_path)
-    
-    # ===== 3. 对齐数据长度 (防止维度报错) =====
-    min_len = min(len(df_rhg), len(df_heu), len(df_duo))
-    df_rhg = df_rhg.iloc[:min_len]
-    df_heu = df_heu.iloc[:min_len]
-    df_duo = df_duo.iloc[:min_len]
-    
-    # 生成时间轴：每步 15分钟 = 0.25小时
-    time_hours = np.arange(min_len) * 0.25 
-    
-    # ===== 4. 提取并转换数据 (注意单位换算) =====
-    # 基准负荷 (取自 Heuristic，单位 kW)
-    base_load = df_heu['base_load_kw'] 
-    
-    # (1) RHG 优化负荷: 注意这里从 MW 转换为 kW
-    rhg_opt_load = df_rhg['opt_load_mw'] * 1000.0
-    
-    # (2) Heuristic 优化负荷 (单位 kW)
-    heu_opt_load = df_heu['opt_load_kw']
-    
-    # (3) Stackelberg/Duopoly 优化负荷 (单位 kW)
-    duo_opt_load = df_duo['opt_load']
+# Physikalische Batteriekonstanten
+BATTERY_CAP = 0.015    # MWh
+SOC_INIT = 0.0075      # MWh, initial 50%
+ALPHA = 0.999
+BETA = 0.95
+S_MAX = 0.015          # MW
 
-    # ===== 5. 开始美观绘图 =====
-    plt.figure(figsize=(15, 8))
-    
-    # (0) 原始基准负荷 (灰色虚线)
-    plt.plot(time_hours, base_load, color='gray', linestyle='--', linewidth=2, alpha=0.7, label='Nominal Load (Baseline)')
-    
-    # (1) RHG 集中式控制 (经典蓝色)
-    plt.plot(time_hours, rhg_opt_load, color='#1f77b4', linewidth=2, alpha=0.9, label='Centralized RHG Control')
-    
-    # (2) 启发式定价 Heuristic (草绿色)
-    plt.plot(time_hours, heu_opt_load, color='#2ca02c', linewidth=2, alpha=0.9, label='Heuristic Price Control')
-    
-    # (3) 终极博弈算法 Stackelberg (鲜艳红色，加粗强调)
-    plt.plot(time_hours, duo_opt_load, color='#d62728', linewidth=3, alpha=1.0, label='Stackelberg Game (Duopoly)')
+# ==========================================
+# 2. 数据预处理：把原始负荷扩展到192点
+# ==========================================
+def prepare_forecast_48h(df: pd.DataFrame, total_steps: int = 192) -> pd.DataFrame:
+    """
+    若原始数据为96点，则复制成48小时（192点）；
+    若已是192点，则直接返回；
+    其他长度则插值到192点。
+    """
+    df = df.copy()
 
-    # ===== 6. 图表装饰与格式化 =====
-    plt.title('Comprehensive Load Smoothing Comparison: RHG vs. Heuristic vs. Stackelberg', fontsize=16, fontweight='bold', pad=20)
-    plt.xlabel('Time [Hours]', fontsize=14, fontweight='bold')
-    plt.ylabel('Total System Power (kW)', fontsize=14, fontweight='bold')
-    
-    # X 轴刻度：每 6 小时显示一个
-    plt.xticks(np.arange(0, int(time_hours[-1]) + 2, 6))
-    plt.xlim(0, time_hours[-1]) 
-    
-    # 启用网格、设置图例
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend(loc='upper right', fontsize=11, framealpha=0.9, ncol=2) # 分两列显示图例，更美观
-    
-    plt.tight_layout()
+    if len(df) == total_steps:
+        return df.reset_index(drop=True)
 
-    # 保存并显示
-    os.makedirs(os.path.dirname(output_fig_path), exist_ok=True)
-    plt.savefig(output_fig_path, dpi=300, bbox_inches='tight')
-    print(f"\n✅ 三重对比图已绘制成功，保存至:\n {output_fig_path}")
-    plt.show()
+    if len(df) == 96 and total_steps == 192:
+        df_48h = pd.concat([df, df], ignore_index=True)
+        return df_48h
 
+    # 其他长度：逐列插值到 total_steps
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not numeric_cols:
+        raise ValueError("forecast_df 中未找到数值列，无法插值。")
+
+    x_old = np.linspace(0, 1, len(df))
+    x_new = np.linspace(0, 1, total_steps)
+
+    out = pd.DataFrame()
+    for col in df.columns:
+        if col in numeric_cols:
+            out[col] = np.interp(x_new, x_old, df[col].values)
+        else:
+            # 非数值列直接丢弃，或者保留空值都可以；这里不保留
+            pass
+
+    return out.reset_index(drop=True)
+
+
+# ==========================================
+# 3. 取滚动窗口：末端不足HORIZON_N时补齐
+# ==========================================
+def get_horizon_slice(df: pd.DataFrame, t_now: int, horizon_n: int) -> pd.DataFrame:
+    """
+    在末端如果剩余数据不足 horizon_n，则用最后一行重复补齐。
+    """
+    slice_df = df.iloc[t_now: t_now + horizon_n].copy()
+
+    if len(slice_df) < horizon_n:
+        last_row = slice_df.iloc[[-1]].copy()
+        pad_count = horizon_n - len(slice_df)
+        pad_df = pd.concat([last_row] * pad_count, ignore_index=True)
+        slice_df = pd.concat([slice_df.reset_index(drop=True), pad_df], ignore_index=True)
+
+    return slice_df
+
+
+# ==========================================
+# 4. Optimierungsmodell
+# ==========================================
+def solve_rhg_optimization(current_soc, forecast_slice, num_agents, N):
+    model = ConcreteModel()
+    model.I = RangeSet(0, num_agents - 1)
+    model.T = RangeSet(0, N - 1)
+
+    # 决策变量：s = 功率, q = 电池电量
+    model.s = Var(model.I, model.T, bounds=(-S_MAX, S_MAX))
+    model.q = Var(model.I, model.T, bounds=(0, BATTERY_CAP))
+
+    # Batterie-Dynamik
+    def soc_dynamics(m, i, t):
+        if t == 0:
+            return m.q[i, t] == current_soc[i]
+        return m.q[i, t] == ALPHA * m.q[i, t - 1] + 0.25 * BETA * m.s[i, t - 1]
+
+    model.soc_con = Constraint(model.I, model.T, rule=soc_dynamics)
+
+    # Zielfunktion：整体负荷平滑 + 电池动作平滑
+    def objective_rule(m):
+        total_obj = 0.0
+        forecast_array = forecast_slice.values
+        avg_load_ref = np.sum(forecast_array) / N
+
+        for t in m.T:
+            base_load_t = np.sum(forecast_array[t, :])
+            net_load = base_load_t + sum(m.s[i, t] for i in m.I)
+
+            # 主目标：削峰填谷 / 向参考均值靠拢
+            total_obj += (net_load - avg_load_ref) ** 2 * 1000
+
+            # 辅助目标：避免过激充放电
+            total_obj += 0.1 * sum(m.s[i, t] ** 2 for i in m.I)
+
+        return total_obj
+
+    model.obj = Objective(rule=objective_rule, sense=minimize)
+
+    solver = SolverFactory(SOLVER_NAME)
+    solver.solve(model, tee=False)
+
+    # 只返回当前时刻的控制量（RHG / MPC思想）
+    u_opt = []
+    for i in range(num_agents):
+        val = value(model.s[i, 0])
+        if val is None:
+            val = 0.0
+        u_opt.append(float(val))
+
+    return u_opt
+
+
+# ==========================================
+# 5. Hauptsimulationsschleife
+# ==========================================
 if __name__ == "__main__":
-    plot_triple_comparison()
+    if not os.path.exists(DATA_FILE):
+        print(f"Fehler: Datendatei {DATA_FILE} nicht gefunden. Bitte führen Sie zuerst prepare_agents.py aus.")
+        sys.exit()
+
+    # 初始化低压网络
+    net = nw.create_cigre_network_lv()
+
+    # 安装14个储能
+    agent_bus_indices = []
+    for i in range(1, NUM_AGENTS + 1):
+        idx = net.bus[net.bus.name == f"Bus R{i}"].index[0]
+        agent_bus_indices.append(idx)
+        pp.create_storage(net, bus=idx, p_mw=0.0, max_e_mwh=BATTERY_CAP)
+
+    # 读取预测数据
+    forecast_df_raw = pd.read_csv(DATA_FILE)
+
+    # 扩展为48小时 / 192点
+    forecast_df = prepare_forecast_48h(forecast_df_raw, TOTAL_SIM_STEPS)
+
+    # SoC 初值
+    soc_tracker = [SOC_INIT] * NUM_AGENTS
+
+    # 结果记录
+    history = {
+        "time_step": [],
+        "base_load_mw": [],
+        "opt_load_mw": [],
+        "transformer_loading_percent": [],
+        "battery_sum_mw": []
+    }
+
+    print(f">>> Führe RHG-Simulation für 48 Stunden aus ({TOTAL_SIM_STEPS} Zeitschritte)...")
+
+    for t_now in range(TOTAL_SIM_STEPS):
+        # 滚动窗口
+        horizon_slice = get_horizon_slice(forecast_df, t_now, HORIZON_N)
+
+        # 求当前时刻最优控制
+        u_opt = solve_rhg_optimization(soc_tracker, horizon_slice, NUM_AGENTS, HORIZON_N)
+
+        # 物理系统更新
+        batt_sum = 0.0
+        for i in range(NUM_AGENTS):
+            net.storage.at[i, "p_mw"] = float(u_opt[i])
+
+            # 更新SOC并限制在物理范围内
+            soc_new = ALPHA * soc_tracker[i] + 0.25 * BETA * u_opt[i]
+            soc_tracker[i] = float(np.clip(soc_new, 0.0, BATTERY_CAP))
+
+            batt_sum += float(u_opt[i])
+
+        # 潮流计算
+        pp.runpp(net)
+
+        # 基础总负荷
+        actual_base = float(forecast_df.iloc[t_now].sum())
+        optimized_load = actual_base + batt_sum
+
+        # 记录结果
+        history["time_step"].append(t_now)
+        history["base_load_mw"].append(actual_base)
+        history["opt_load_mw"].append(optimized_load)
+        history["transformer_loading_percent"].append(float(net.res_trafo.loading_percent.values[0]))
+        history["battery_sum_mw"].append(batt_sum)
+
+        if t_now % 12 == 0:
+            print(
+                f"t={t_now:03d} | "
+                f"Basislast: {actual_base:.4f} MW | "
+                f"Optimiert: {optimized_load:.4f} MW | "
+                f"BattSum: {batt_sum:.4f} MW | "
+                f"Trafo: {history['transformer_loading_percent'][-1]:.2f}%"
+            )
+
+    # 保存结果
+    res_df = pd.DataFrame(history)
+    output_path = os.path.join(current_dir, "data", "simulation_results_rhg_18bus.csv")
+    res_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+
+    print(f"\nSimulation erfolgreich abgeschlossen! Ergebnisse gespeichert unter: {output_path}")
