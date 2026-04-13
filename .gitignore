@@ -1,0 +1,17 @@
+# 忽略 Python 缓存
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# 忽略虚拟环境
+venv/
+ENV/
+
+# 忽略 VS Code 配置
+.vscode/
+
+# 忽略输出文件（如果你不想分享结果图片和CSV）
+outputs/
+
+# 忽略数据文件（如果文件太大）
+# data/*.csv
